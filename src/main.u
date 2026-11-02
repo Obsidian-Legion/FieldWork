@@ -1,0 +1,387 @@
+use lib.base
+use lib.unison_http_16_1_0
+use lib.unison_http_16_1_0.server
+use lib.unison_json_1_4_2.core Json
+use Text ++
+
+fw.field : Text -> Json -> Json
+fw.field key = cases
+  Json.Object fields -> Optional.getOrElse Json.Null (List.findMap (cases (k, v) -> if k === key then Some v else None) fields)
+  _ -> Json.Null
+
+fw.text : Json -> Text
+fw.text = cases
+  Json.Text t -> t
+  _ -> ""
+
+fw.list : Json -> [Json]
+fw.list = cases
+  Json.Array xs -> xs
+  _ -> []
+
+fw.number : Json -> Nat
+fw.number = cases
+  Json.Number n -> Optional.getOrElse 0 (Nat.fromText n)
+  _ -> 0
+
+fw.hasText : Text -> Nat -> Json -> Boolean
+fw.hasText key limit j = match fw.field key j with
+  Json.Text t -> Text.size t <= limit
+  _ -> false
+
+fw.id : Text -> Boolean
+fw.id t = Text.size t === 36 && List.all (c -> List.contains c (Text.toCharList "0123456789abcdef-")) (Text.toCharList t)
+
+fw.ext : Text -> Boolean
+fw.ext t = List.contains t ["pdf", "mp4", "webm", "txt", "md"]
+
+fw.isBoolean : Json -> Boolean
+fw.isBoolean = cases
+  Json.Boolean _ -> true
+  _ -> false
+
+fw.isNumber : Json -> Boolean
+fw.isNumber = cases
+  Json.Number _ -> true
+  _ -> false
+
+fw.lesson : Json -> Boolean
+fw.lesson j = fw.id (fw.text (fw.field "id" j)) && fw.ext (fw.text (fw.field "ext" j)) && fw.hasText "title" 500 j && fw.hasText "name" 500 j && fw.isBoolean (fw.field "completed" j)
+
+fw.course : Json -> Boolean
+fw.course j =
+  fields = List.all (key -> fw.hasText key 40000 j) ["title", "description", "sector", "level", "notes", "createdAt"]
+  coords = List.all (key -> fw.isNumber (fw.field key j)) ["x", "y"]
+  files = match fw.field "lessons" j with
+    Json.Array xs -> List.size xs <= 1000 && List.all fw.lesson xs
+    _ -> false
+  archived = fw.isBoolean (fw.field "archived" j)
+  fw.id (fw.text (fw.field "id" j)) && fields && coords && files && archived && Text.size (fw.text (fw.field "title" j)) > 0
+
+fw.valid : Json -> Boolean
+fw.valid j = match (fw.field "courses" j, fw.field "links" j) with
+  (Json.Array cs, Json.Array ls) -> List.size cs <= 5000 && List.all fw.course cs && List.all (l -> fw.id (fw.text (fw.field "a" l)) && fw.id (fw.text (fw.field "b" l))) ls
+  _ -> false
+
+fw.empty : Json
+fw.empty = Json.object [("revision", Json.nat 0), ("courses", Json.array []), ("links", Json.array [])]
+
+fw.header : Text -> Headers -> Text
+fw.header key headers = Optional.getOrElse "" (List.head (Headers.getValues key headers))
+
+fw.response : Nat -> Text -> Bytes -> HttpResponse
+fw.response code mime bytes =
+  HttpResponse.HttpResponse (Status.Status code "") Version.http11 (Headers.fromList [("Content-Type", mime), ("Content-Length", Nat.toText (Bytes.size bytes)), ("Cache-Control", "no-store"), ("X-Content-Type-Options", "nosniff"), ("Referrer-Policy", "no-referrer"), ("Cross-Origin-Resource-Policy", "same-origin"), ("X-Frame-Options", "SAMEORIGIN")]) (Body.Body bytes)
+
+fw.json : Nat -> Json -> HttpResponse
+fw.json code j = fw.response code "application/json; charset=utf-8" (Text.toUtf8 (Json.toText j))
+
+fw.error : Nat -> Text -> HttpResponse
+fw.error code message = fw.json code (Json.object [("error", Json.text message)])
+
+fw.mime : Text -> Text
+fw.mime = cases
+  "pdf" -> "application/pdf"
+  "mp4" -> "video/mp4"
+  "webm" -> "video/webm"
+  "txt" -> "text/plain; charset=utf-8"
+  "md" -> "text/plain; charset=utf-8"
+  "html" -> "text/html; charset=utf-8"
+  "css" -> "text/css; charset=utf-8"
+  "js" -> "text/javascript; charset=utf-8"
+  "svg" -> "image/svg+xml"
+  _ -> "application/octet-stream"
+
+fw.ensure : Text ->{IO, Exception} ()
+fw.ensure path = if FilePath.isDirectory (FilePath path) then () else FilePath.createDirectory (FilePath path)
+
+fw.persist : Text -> Json ->{IO, Exception} ()
+fw.persist dir value =
+  temp = FilePath (dir ++ "/state.next")
+  FilePath.writeFileUtf8 temp (Json.toText value)
+  FilePath.renameFile temp (FilePath (dir ++ "/state.json"))
+
+fw.range : Text -> Nat -> Optional (Nat, Nat)
+fw.range text total =
+  if total === 0 || not (Text.startsWith "bytes=" text) then None
+  else match Text.splitOnText "-" (Text.drop 6 text) with
+    ["", suffix] -> match Nat.fromText suffix with
+      Some n -> if n > 0 then Some (total Nat.- n, total Nat.- 1) else None
+      _ -> None
+    [start, finish] -> match Nat.fromText start with
+      Some a ->
+        b = if finish === "" then Some (total Nat.- 1) else Nat.fromText finish
+        match b with
+          Some end -> if a < total && end >= a then Some (a, Nat.min end (total Nat.- 1)) else None
+          _ -> None
+      _ -> None
+    _ -> None
+
+fw.fileResponse : Headers -> Text -> Bytes -> HttpResponse
+fw.fileResponse headers ext bytes =
+  total = Bytes.size bytes
+  value = fw.header "Range" headers
+  if value === "" then HttpResponse.addHeader "Accept-Ranges" "bytes" (fw.response 200 (fw.mime ext) bytes)
+  else match fw.range value total with
+    Some (a, b) ->
+      part = Bytes.take ((b Nat.- a) Nat.+ 1) (Bytes.drop a bytes)
+      fw.response 206 (fw.mime ext) part |> HttpResponse.addHeader "Accept-Ranges" "bytes" |> HttpResponse.addHeader "Content-Range" ("bytes " ++ Nat.toText a ++ "-" ++ Nat.toText b ++ "/" ++ Nat.toText total)
+    None -> fw.error 416 "Invalid range" |> HttpResponse.addHeader "Content-Range" ("bytes */" ++ Nat.toText total)
+
+-- Azure Easy Auth verifies GitHub; only its injected principal is accepted.
+-- Local mode stays loopback-only. Locked mode exposes no course data.
+structural type fw.Storage = Disk Text | Blob Text
+structural type fw.Settings = { storage : fw.Storage, mode : Text, origin : Text, admins : [Text] }
+structural type fw.User = { id : Text, name : Text, admin : Boolean }
+
+fw.env : Text -> Text ->{IO} Text
+fw.env key fallback = match IO.catchAll (do IO.getEnv key) with
+  Right value -> value
+  Left _ -> fallback
+
+fw.fail : Text ->{Exception} a
+fw.fail message = Exception.raise (Failure (typeLink Text) message (Any.Any ()))
+
+fw.set : Text -> Json -> Json -> Json
+fw.set key value = cases
+  Json.Object fields -> Json.object (List.filter (cases (k, _) -> k != key) fields List.:+ (key, value))
+  _ -> Json.object [(key, value)]
+
+fw.getById : Text -> [Json] -> Json
+fw.getById id xs = Optional.getOrElse Json.Null (List.find (x -> fw.text (fw.field "id" x) === id) xs)
+
+fw.numericId : Text -> Boolean
+fw.numericId id = Text.size id > 0 && Text.size id <= 30 && List.all (c -> List.contains c (Text.toCharList "0123456789")) (Text.toCharList id)
+
+fw.identity : fw.Settings -> Headers -> Optional fw.User
+fw.identity settings headers =
+  mode = fw.Settings.mode settings
+  id = fw.header "X-MS-CLIENT-PRINCIPAL-ID" headers
+  provider = fw.header "X-MS-CLIENT-PRINCIPAL-IDP" headers
+  name = fw.header "X-MS-CLIENT-PRINCIPAL-NAME" headers
+  if mode === "local" then Some (fw.User.User "local-owner" "Local workspace" true)
+  else if mode === "azure" && provider === "github" && fw.numericId id && Text.size name > 0 && Text.size name < 256 then
+    Some (fw.User.User id name (List.contains id (fw.Settings.admins settings)))
+  else None
+
+fw.http : HttpRequest ->{IO, Exception} HttpResponse
+fw.http request = Threads.run do lib.unison_http_16_1_0.client.Http.run do lib.unison_http_16_1_0.client.Http.request request
+
+fw.blobRequest : Text -> Text -> Method -> Bytes -> [(Text, Text)] ->{IO, Exception} HttpResponse
+fw.blobRequest base key method bytes extra =
+  endpoint = IO.getEnv "IDENTITY_ENDPOINT"
+  secret = IO.getEnv "IDENTITY_HEADER"
+  clientId = fw.env "AZURE_CLIENT_ID" ""
+  identityQuery = if clientId === "" then "" else "&client_id=" ++ clientId
+  tokenRequest = HttpRequest.get (URI.parse (endpoint ++ "?resource=https%3A%2F%2Fstorage.azure.com%2F&api-version=2019-08-01" ++ identityQuery)) |> HttpRequest.addHeader "X-IDENTITY-HEADER" secret
+  tokenResponse = fw.http tokenRequest
+  tokenJson = Json.fromText (Text.fromUtf8 (Body.toBytes (HttpResponse.body tokenResponse)))
+  token = fw.text (fw.field "access_token" tokenJson)
+  if token === "" then fw.fail "Storage identity unavailable" else ()
+  requestDate = lib.base.time.Instant.toRFC1123 (lib.base.time.Instant.now ())
+  uri = URI.parse (base ++ "/" ++ key)
+  request = if method === GET then HttpRequest.get uri else HttpRequest.put uri (Body.Body bytes)
+  withHeaders = List.foldLeft (req -> cases (k, v) -> HttpRequest.addHeader k v req) request ([("Authorization", "Bearer " ++ token), ("x-ms-version", "2023-11-03"), ("x-ms-date", requestDate), ("x-ms-blob-type", "BlockBlob"), ("Content-Length", Nat.toText (Bytes.size bytes))] List.++ extra)
+  fw.http withHeaders
+
+fw.read : fw.Storage -> Text ->{IO, Exception} (Bytes, Text)
+fw.read storage key = match storage with
+  fw.Storage.Disk dir ->
+    path = FilePath (dir ++ "/" ++ key)
+    if FilePath.exists path then (FilePath.readFile path, "disk") else (Bytes.empty, "")
+  fw.Storage.Blob base ->
+    response = fw.blobRequest base key GET Bytes.empty []
+    code = Status.code (HttpResponse.status response)
+    if code === 404 then (Bytes.empty, "")
+    else if code === 200 || code === 206 then (Body.toBytes (HttpResponse.body response), fw.header "ETag" (HttpResponse.headers response))
+    else fw.fail "Storage read failed"
+
+fw.write : fw.Storage -> Text -> Text -> Bytes ->{IO, Exception} Boolean
+fw.write storage key etag bytes = match storage with
+  fw.Storage.Disk dir ->
+    path = FilePath (dir ++ "/" ++ key)
+    if etag === "" && FilePath.exists path then false
+    else
+      temp = FilePath (dir ++ "/" ++ key ++ ".next")
+      FilePath.writeFile temp bytes
+      FilePath.renameFile temp path
+      true
+  fw.Storage.Blob base ->
+    condition = if etag === "" then ("If-None-Match", "*") else ("If-Match", etag)
+    response = fw.blobRequest base key PUT bytes [condition]
+    code = Status.code (HttpResponse.status response)
+    if code === 412 || code === 409 then false
+    else if code === 201 then true
+    else fw.fail "Storage write failed"
+
+fw.readJson : fw.Storage -> Text -> Json ->{IO, Exception} (Json, Text)
+fw.readJson storage key fallback =
+  (bytes, etag) = fw.read storage key
+  if etag === "" then (fallback, etag) else (Json.fromText (Text.fromUtf8 bytes), etag)
+
+fw.writeJson : fw.Storage -> Text -> Text -> Json ->{IO, Exception} Boolean
+fw.writeJson storage key etag value = fw.write storage key etag (Text.toUtf8 (Json.toText value))
+
+fw.progressKey : fw.User -> Text
+fw.progressKey user = "users/" ++ fw.User.id user ++ ".json"
+
+fw.progressEmpty : Json
+fw.progressEmpty = Json.object [("revision", Json.nat 0), ("courses", Json.array [])]
+
+fw.cleanCourse : Json -> Json
+fw.cleanCourse c =
+  lessons = List.map (l -> fw.set "completed" (Json.boolean false) l) (fw.list (fw.field "lessons" c))
+  c |> fw.set "notes" (Json.text "") |> fw.set "lessons" (Json.array lessons)
+
+fw.visible : fw.User -> Json -> [Json]
+fw.visible user catalog = List.filter (c -> fw.User.admin user || not (fw.field "archived" c === Json.boolean true)) (fw.list (fw.field "courses" catalog))
+
+fw.view : fw.User -> Json -> Json -> Json
+fw.view user catalog progress =
+  visible = fw.visible user catalog
+  personal = fw.list (fw.field "courses" progress)
+  courses = List.map (c -> let
+    id = fw.text (fw.field "id" c)
+    p = fw.getById id personal
+    done = fw.list (fw.field "completed" p)
+    lessons = List.map (l -> fw.set "completed" (Json.boolean (List.contains (fw.field "id" l) done)) l) (fw.list (fw.field "lessons" c))
+    note = fw.set "notes" (Json.text (fw.text (fw.field "notes" p))) c
+    positioned = if fw.isNumber (fw.field "x" p) && fw.isNumber (fw.field "y" p) then note |> fw.set "x" (fw.field "x" p) |> fw.set "y" (fw.field "y" p) else note
+    fw.set "lessons" (Json.array lessons) positioned) visible
+  ids = List.map (fw.field "id") visible
+  links = List.filter (l -> List.contains (fw.field "a" l) ids && List.contains (fw.field "b" l) ids) (fw.list (fw.field "links" catalog))
+  Json.object [("revision", fw.field "revision" catalog), ("personalRevision", fw.field "revision" progress), ("courses", Json.array courses), ("links", Json.array links)]
+
+fw.userJson : fw.Settings -> fw.User -> Json
+fw.userJson settings user =
+  github = if fw.Settings.mode settings === "azure" then Json.object [("id", Json.text (fw.User.id user)), ("login", Json.text (fw.User.name user)), ("url", Json.text ("https://github.com/" ++ fw.User.name user))] else Json.Null
+  Json.object [("id", Json.text (fw.User.id user)), ("name", Json.text (fw.User.name user)), ("role", Json.text (if fw.User.admin user then "admin" else "member")), ("github", github)]
+
+fw.session : fw.Settings -> Optional fw.User ->{IO, Exception} HttpResponse
+fw.session settings identity = match identity with
+  None -> fw.json 200 (Json.object [("authenticated", Json.boolean false), ("configured", Json.boolean (fw.Settings.mode settings === "azure")), ("loginUrl", Json.text "/.auth/login/github?post_login_redirect_uri=/")])
+  Some user ->
+    profile = fw.userJson settings user
+    if fw.Settings.mode settings === "azure" then
+      key = "profiles/" ++ fw.User.id user ++ ".json"
+      (_, etag) = fw.read (fw.Settings.storage settings) key
+      _ = fw.writeJson (fw.Settings.storage settings) key etag profile
+      ()
+    else ()
+    fw.json 200 (Json.object [("authenticated", Json.boolean true), ("local", Json.boolean (fw.Settings.mode settings === "local")), ("user", profile)])
+
+fw.memberRoute : fw.Settings -> fw.User -> Method -> [Text] -> Headers -> Body ->{IO, Exception} HttpResponse
+fw.memberRoute settings user method path headers body =
+  storage = fw.Settings.storage settings
+  (catalog, catalogTag) = fw.readJson storage "state.json" fw.empty
+  (progress, progressTag) = fw.readJson storage (fw.progressKey user) fw.progressEmpty
+  match (method, path) with
+    (GET, ["api", "state"]) -> fw.json 200 (fw.view user catalog progress)
+    (PUT, ["api", "state"]) ->
+      if not (fw.User.admin user) then fw.error 403 "Admin access required"
+      else if Bytes.size (Body.toBytes body) > 8388608 then fw.error 413 "Library too large"
+      else match Json.catchFromText (Text.fromUtf8 (Body.toBytes body)) with
+        Left _ -> fw.error 400 "Invalid JSON"
+        Right incoming ->
+          revision = fw.number (fw.field "revision" catalog)
+          if not (fw.valid incoming) then fw.error 400 "Invalid library"
+          else if fw.header "If-Match" headers != Nat.toText revision then fw.error 409 "Library changed"
+          else
+            courses = List.map fw.cleanCourse (fw.list (fw.field "courses" incoming))
+            next = Json.object [("revision", Json.nat (revision Nat.+ 1)), ("courses", Json.array courses), ("links", fw.field "links" incoming)]
+            if fw.writeJson storage "state.json" catalogTag next then fw.json 200 (fw.view user next progress) else fw.error 409 "Library changed"
+    (PUT, ["api", "progress"]) ->
+      if Bytes.size (Body.toBytes body) > 8388608 then fw.error 413 "Progress too large"
+      else match Json.catchFromText (Text.fromUtf8 (Body.toBytes body)) with
+        Left _ -> fw.error 400 "Invalid JSON"
+        Right incoming ->
+          revision = fw.number (fw.field "revision" progress)
+          if not (fw.valid incoming) then fw.error 400 "Invalid progress"
+          else if fw.header "If-Match" headers != Nat.toText revision then fw.error 409 "Progress changed"
+          else
+            visible = fw.visible user catalog
+            changes = fw.list (fw.field "courses" incoming)
+            saved = List.map (c -> let
+              id = fw.text (fw.field "id" c)
+              p = fw.getById id changes
+              previous = fw.getById id (fw.list (fw.field "courses" progress))
+              if p === Json.Null then previous
+              else
+                lessonIds = List.map (fw.field "id") (fw.list (fw.field "lessons" c))
+                completed = List.filter (l -> fw.field "completed" l === Json.boolean true && List.contains (fw.field "id" l) lessonIds) (fw.list (fw.field "lessons" p))
+                Json.object [("id", Json.text id), ("notes", fw.field "notes" p), ("x", fw.field "x" p), ("y", fw.field "y" p), ("completed", Json.array (List.map (fw.field "id") completed))]) visible
+            hidden = List.filter (p -> not (List.contains (fw.field "id" p) (List.map (fw.field "id") visible))) (fw.list (fw.field "courses" progress))
+            next = Json.object [("revision", Json.nat (revision Nat.+ 1)), ("courses", Json.array ((List.filter (p -> not (p === Json.Null)) saved) List.++ hidden))]
+            if fw.writeJson storage (fw.progressKey user) progressTag next then fw.json 200 (fw.view user catalog next) else fw.error 409 "Progress changed"
+    (PUT, ["api", "files", id, ext]) ->
+      if not (fw.User.admin user) then fw.error 403 "Admin access required"
+      else if not (fw.id id && fw.ext ext) then fw.error 400 "Invalid file"
+      else
+        bytes = Body.toBytes body
+        if Bytes.size bytes === 0 || Bytes.size bytes > 104857600 then fw.error 413 "File limit: 100 MB"
+        else if fw.write storage ("files/" ++ id ++ "." ++ ext) "" bytes then fw.json 201 (Json.object [("id", Json.text id)]) else fw.error 409 "File exists"
+    (GET, ["api", "files", id, ext]) ->
+      referenced = List.any (c -> List.any (l -> fw.field "id" l === Json.text id && fw.field "ext" l === Json.text ext) (fw.list (fw.field "lessons" c))) (fw.visible user catalog)
+      if not (fw.id id && fw.ext ext && (fw.User.admin user || referenced)) then fw.error 404 "Not found"
+      else
+        (bytes, etag) = fw.read storage ("files/" ++ id ++ "." ++ ext)
+        if etag === "" then fw.error 404 "Not found" else fw.fileResponse headers ext bytes
+    _ -> fw.error 404 "Not found"
+
+fw.route : fw.Settings -> MVar () -> HttpRequest ->{IO, Exception} HttpResponse
+fw.route settings lock request =
+  (method, path, headers, body) = match request with
+    HttpRequest.HttpRequest m _ (URI.URI _ _ (Path.Path p) _ _) h b -> (m, p, h, b)
+  origin = fw.header "Origin" headers
+  configuredOrigin = fw.Settings.origin settings
+  host = fw.header "Host" headers
+  expectedHost = Text.drop (if Text.startsWith "https://" configuredOrigin then 8 else 7) configuredOrigin
+  localHost = fw.Settings.mode settings === "local" && Text.replaceAll "127.0.0.1" "localhost" expectedHost === host
+  trusted = origin === "" || origin === configuredOrigin || (fw.Settings.mode settings === "local" && origin === Text.replaceAll "127.0.0.1" "localhost" configuredOrigin)
+  identity = fw.identity settings headers
+  if path === ["health"] && method === GET then fw.json 200 (Json.object [("status", Json.text "ok")])
+  else if (fw.Settings.mode settings != "locked" && not (host === expectedHost || localHost)) || not trusted then fw.error 403 "Invalid origin"
+  else match (method, path) with
+    (GET, ["api", "session"]) -> fw.session settings identity
+    (GET, []) -> fw.response 200 (fw.mime "html") (FilePath.readFile (FilePath "ui/index.html"))
+    (GET, ["style.css"]) -> fw.response 200 (fw.mime "css") (FilePath.readFile (FilePath "ui/style.css"))
+    (GET, ["app.js"]) -> fw.response 200 (fw.mime "js") (FilePath.readFile (FilePath "ui/app.js"))
+    (GET, ["favicon.svg"]) -> fw.response 200 (fw.mime "svg") (FilePath.readFile (FilePath "ui/favicon.svg"))
+    _ -> match identity with
+      None -> fw.error 401 "Sign in required"
+      Some user -> MVar.modify lock (_ -> let
+        response = fw.memberRoute settings user method path headers body
+        ((), response))
+
+fw.wait : '{IO, Exception} ()
+fw.wait = do
+  sleepMicroseconds 60000000
+  fw.wait ()
+
+main : '{IO, Exception} ()
+main = do
+  args = IO.getArgs ()
+  dir = Optional.getOrElse "data" (List.at 0 args)
+  port = Optional.getOrElse "8787" (List.at 1 args)
+  mode = fw.env "FIELDWORK_AUTH" "local"
+  bind = fw.env "FIELDWORK_BIND" "127.0.0.1"
+  if mode === "local" && bind != "127.0.0.1" then fw.fail "Local mode must bind to loopback" else ()
+  if not (List.contains mode ["local", "locked", "azure"]) then fw.fail "Unknown authentication mode" else ()
+  origin = fw.env "FIELDWORK_ORIGIN" ("http://127.0.0.1:" ++ port)
+  admins = Text.splitOnText "," (fw.env "FIELDWORK_ADMIN_IDS" "")
+  blob = fw.env "FIELDWORK_BLOB_URL" ""
+  storage = if blob === "" then
+    fw.ensure dir
+    fw.ensure (dir ++ "/files")
+    fw.ensure (dir ++ "/users")
+    fw.ensure (dir ++ "/profiles")
+    fw.Storage.Disk dir
+  else fw.Storage.Blob blob
+  settings = fw.Settings.Settings storage mode origin admins
+  lock = MVar.new ()
+  routes = Routes.Routes [Handler.Handler (fw.route settings lock)] (_ -> fw.error 404 "Not found") (_ _ -> fw.error 500 "Storage unavailable")
+  config = Config.default |> Config.hostName.set (Some (HostName.HostName bind)) |> Config.port.set (Port.Port port) |> Config.idleTimeoutSeconds.set (Some 300)
+  Threads.run do
+    Config.serve routes config
+    printLine ("FIELDWORK / " ++ origin)
+    fw.wait ()

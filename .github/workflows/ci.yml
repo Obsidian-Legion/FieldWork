@@ -1,0 +1,42 @@
+name: Verify FIELDWORK
+on: [push, pull_request, workflow_dispatch]
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - run: node --check ui/app.js
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: fieldwork:verify
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Verify isolated roles and storage
+        run: |
+          docker run -d --name fieldwork-test -p 127.0.0.1:8788:8787 \
+            -e FIELDWORK_AUTH=azure -e FIELDWORK_ADMIN_IDS=101 \
+            -e FIELDWORK_ORIGIN=http://127.0.0.1:8788 fieldwork:verify
+          for attempt in $(seq 1 30); do
+            curl --fail --silent http://127.0.0.1:8788/health && break
+            sleep 1
+          done
+          node scripts/verify-auth.mjs
+      - name: Verify locked deployment
+        run: |
+          docker run -d --name fieldwork-locked -p 127.0.0.1:8789:8787 fieldwork:verify
+          for attempt in $(seq 1 30); do
+            curl --fail --silent http://127.0.0.1:8789/health && break
+            sleep 1
+          done
+          node scripts/verify-locked.mjs
+      - if: always()
+        run: docker logs fieldwork-test; docker logs fieldwork-locked

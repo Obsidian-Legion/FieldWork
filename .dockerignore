@@ -1,0 +1,9 @@
+*
+!Dockerfile
+!src
+!src/**
+!ui
+!ui/**
+!scripts
+!scripts/setup.md
+!scripts/build.md

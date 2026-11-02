@@ -1,0 +1,13 @@
+.unison/
+data/
+*.uc
+*.output.md
+outputs/
+.runtime/
+
+.runtime-test/
+.unisonHistory
+.env
+.env.*
+!.env.example
+infra/*.local.*
