@@ -31,6 +31,7 @@ function applySession(value){
 }
 async function load(){try{
   const auth=await fetch('/api/session',{cache:'no-store'});
+  if(auth.status===401){applySession({authenticated:false,configured:true});return;}
   if(!auth.ok)throw Error();
   applySession(await auth.json());
   if(!session.authenticated)return;

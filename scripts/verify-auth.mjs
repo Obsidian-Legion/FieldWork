@@ -17,6 +17,14 @@ assert.equal((await (await request('/api/session',admin)).json()).user.role,'adm
 assert.equal((await (await request('/api/session',alice)).json()).user.role,'member');
 assert.equal((await request('/api/state',null,{headers:{...identity(admin),'X-MS-CLIENT-PRINCIPAL-IDP':'google'}})).status,401);
 assert.equal((await request('/api/state','../../state')).status,401);
+// Azure's GitHub principal can omit NAME; the username is in urn:github:login.
+const principal=(provider='github',id=admin)=>Buffer.from(JSON.stringify({auth_typ:provider,claims:[{typ:'urn:github:id',val:id},{typ:'urn:github:login',val:'verification-admin'}]})).toString('base64');
+const azureHeaders={'X-MS-CLIENT-PRINCIPAL-ID':admin,'X-MS-CLIENT-PRINCIPAL-IDP':'github','X-MS-CLIENT-PRINCIPAL':principal()};
+const azureSession=await (await request('/api/session',null,{headers:azureHeaders})).json();
+assert.equal(azureSession.user.role,'admin');assert.equal(azureSession.user.github.login,'verification-admin');
+assert.equal((await request('/api/state',null,{headers:{...azureHeaders,'X-MS-CLIENT-PRINCIPAL':principal('google')}})).status,401);
+assert.equal((await request('/api/state',null,{headers:{...azureHeaders,'X-MS-CLIENT-PRINCIPAL':principal('github',alice)}})).status,401);
+assert.equal((await request('/api/state',null,{headers:{...identity(admin),'X-MS-CLIENT-PRINCIPAL':'not-base64'}})).status,401);
 const file=randomUUID(),course=randomUUID(),payload='Private course file\n0123456789';
 assert.equal((await request(`/api/files/${file}/txt`,alice,{method:'PUT',body:payload})).status,403);
 assert.equal((await request(`/api/files/${file}/txt`,admin,{method:'PUT',body:payload})).status,201);

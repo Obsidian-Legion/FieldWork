@@ -153,14 +153,36 @@ fw.getById id xs = Optional.getOrElse Json.Null (List.find (x -> fw.text (fw.fie
 fw.numericId : Text -> Boolean
 fw.numericId id = Text.size id > 0 && Text.size id <= 30 && List.all (c -> List.contains c (Text.toCharList "0123456789")) (Text.toCharList id)
 
+fw.principal : Headers -> Json
+fw.principal headers =
+  encoded = fw.header "X-MS-CLIENT-PRINCIPAL" headers
+  if Text.size encoded > 65536 then Json.Null else
+    match Bytes.fromBase64.impl (Text.toUtf8 encoded) with
+      Left _ -> Json.Null
+      Right bytes -> match Text.fromUtf8.impl bytes with
+        Left _ -> Json.Null
+        Right text -> match Json.catchFromText text with
+          Left _ -> Json.Null
+          Right value -> value
+
+fw.claim : Text -> Json -> Text
+fw.claim key principal =
+  Optional.getOrElse "" (List.findMap (c -> if fw.text (fw.field "typ" c) === key then Some (fw.text (fw.field "val" c)) else None) (fw.list (fw.field "claims" principal)))
+
 fw.identity : fw.Settings -> Headers -> Optional fw.User
 fw.identity settings headers =
   mode = fw.Settings.mode settings
   id = fw.header "X-MS-CLIENT-PRINCIPAL-ID" headers
-  provider = fw.header "X-MS-CLIENT-PRINCIPAL-IDP" headers
-  name = fw.header "X-MS-CLIENT-PRINCIPAL-NAME" headers
+  principal = fw.principal headers
+  providerHeader = fw.header "X-MS-CLIENT-PRINCIPAL-IDP" headers
+  providerClaim = fw.text (fw.field "auth_typ" principal)
+  provider = if providerHeader === "" then providerClaim else providerHeader
+  loginClaim = fw.claim "urn:github:login" principal
+  name = if loginClaim === "" then fw.header "X-MS-CLIENT-PRINCIPAL-NAME" headers else loginClaim
+  idClaim = fw.claim "urn:github:id" principal
+  principalValid = fw.header "X-MS-CLIENT-PRINCIPAL" headers === "" || (providerClaim === "github" && (idClaim === "" || idClaim === id))
   if mode === "local" then Some (fw.User.User "local-owner" "Local workspace" true)
-  else if mode === "azure" && provider === "github" && fw.numericId id && Text.size name > 0 && Text.size name < 256 then
+  else if mode === "azure" && provider === "github" && principalValid && fw.numericId id && Text.size name > 0 && Text.size name < 256 then
     Some (fw.User.User id name (List.contains id (fw.Settings.admins settings)))
   else None
 
