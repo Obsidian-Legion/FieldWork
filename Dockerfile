@@ -26,6 +26,7 @@ RUN useradd --create-home --uid 10001 fieldwork
 WORKDIR /app
 COPY --from=build /build/.runtime/fieldwork.uc ./fieldwork.uc
 COPY ui ./ui
+COPY content ./content
 RUN mkdir data && chown fieldwork:fieldwork data
 USER fieldwork
 ENV FIELDWORK_BIND=0.0.0.0 FIELDWORK_AUTH=locked

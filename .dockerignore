@@ -4,6 +4,8 @@
 !src/**
 !ui
 !ui/**
+!content
+!content/**
 !scripts
 !scripts/setup.md
 !scripts/build.md

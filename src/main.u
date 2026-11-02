@@ -48,6 +48,24 @@ fw.isNumber = cases
 fw.lesson : Json -> Boolean
 fw.lesson j = fw.id (fw.text (fw.field "id" j)) && fw.ext (fw.text (fw.field "ext" j)) && fw.hasText "title" 500 j && fw.hasText "name" 500 j && fw.isBoolean (fw.field "completed" j)
 
+fw.shortText : Nat -> Json -> Boolean
+fw.shortText limit = cases
+  Json.Text t -> Text.size t > 0 && Text.size t <= limit
+  _ -> false
+
+fw.offering : Json -> Boolean
+fw.offering = cases
+  Json.Null -> true
+  value ->
+    texts = List.all (key -> fw.hasText key 100 value) ["format", "cost", "timeZone"]
+    sessions = match fw.field "sessions" value with
+      Json.Array xs -> List.size xs > 0 && List.size xs <= 100 && List.all (fw.shortText 64) xs
+      _ -> false
+    topics = match fw.field "topics" value with
+      Json.Array xs -> List.size xs <= 100 && List.all (fw.shortText 300) xs
+      _ -> false
+    texts && sessions && topics && fw.isBoolean (fw.field "registrationOpen" value)
+
 fw.course : Json -> Boolean
 fw.course j =
   fields = List.all (key -> fw.hasText key 40000 j) ["title", "description", "sector", "level", "notes", "createdAt"]
@@ -56,7 +74,7 @@ fw.course j =
     Json.Array xs -> List.size xs <= 1000 && List.all fw.lesson xs
     _ -> false
   archived = fw.isBoolean (fw.field "archived" j)
-  fw.id (fw.text (fw.field "id" j)) && fields && coords && files && archived && Text.size (fw.text (fw.field "title" j)) > 0
+  fw.id (fw.text (fw.field "id" j)) && fields && coords && files && archived && fw.offering (fw.field "offering" j) && Text.size (fw.text (fw.field "title" j)) > 0
 
 fw.valid : Json -> Boolean
 fw.valid j = match (fw.field "courses" j, fw.field "links" j) with
@@ -244,6 +262,62 @@ fw.readJson storage key fallback =
 fw.writeJson : fw.Storage -> Text -> Text -> Json ->{IO, Exception} Boolean
 fw.writeJson storage key etag value = fw.write storage key etag (Text.toUtf8 (Json.toText value))
 
+-- Publish the supplied launch course once. Existing edits and archives are preserved.
+fw.publishLaunch : fw.Storage -> Nat ->{IO, Exception} ()
+fw.publishLaunch storage attempts =
+  launch = Json.fromText (FilePath.readFileUtf8 (FilePath "content/launch-course.json"))
+  if not (fw.course launch) then fw.fail "Invalid launch course" else ()
+  (catalog, tag) = fw.readJson storage "state.json" fw.empty
+  courses = fw.list (fw.field "courses" catalog)
+  if not (fw.getById (fw.text (fw.field "id" launch)) courses === Json.Null) then ()
+  else
+    next = catalog |> fw.set "courses" (Json.array (courses List.:+ launch)) |> fw.set "revision" (Json.nat (fw.number (fw.field "revision" catalog) Nat.+ 1))
+    if fw.writeJson storage "state.json" tag next then ()
+    else if attempts > 0 then fw.publishLaunch storage (attempts Nat.- 1)
+    else fw.fail "Launch course publication conflict"
+
+fw.publicCourses : fw.Storage ->{IO, Exception} HttpResponse
+fw.publicCourses storage =
+  (catalog, _) = fw.readJson storage "state.json" fw.empty
+  courses = List.filter (c -> not (fw.field "archived" c === Json.boolean true) && not (fw.field "offering" c === Json.Null)) (fw.list (fw.field "courses" catalog))
+  public = List.map (c -> Json.object (List.map (key -> (key, fw.field key c)) ["id", "title", "description", "sector", "level", "offering"])) courses
+  fw.json 200 (Json.object [("courses", Json.array public)])
+
+fw.registrationEmpty : Json
+fw.registrationEmpty = Json.object [("revision", Json.nat 0), ("registrations", Json.array [])]
+
+fw.registrationList : fw.Storage -> fw.User -> Boolean -> Json ->{IO, Exception} HttpResponse
+fw.registrationList storage user adminView catalog =
+  if adminView && not (fw.User.admin user) then fw.error 403 "Admin access required"
+  else
+    (saved, _) = fw.readJson storage "registrations.json" fw.registrationEmpty
+    own = List.filter (r -> adminView || fw.text (fw.field "userId" r) === fw.User.id user) (fw.list (fw.field "registrations" saved))
+    rows = List.map (r -> let
+      course = fw.getById (fw.text (fw.field "courseId" r)) (fw.list (fw.field "courses" catalog))
+      fw.set "courseTitle" (fw.field "title" course) r) own
+    fw.json 200 (Json.object [("registrations", Json.array rows)])
+
+fw.register : fw.Settings -> fw.User -> Text -> Nat ->{IO, Exception} HttpResponse
+fw.register settings user courseId attempts =
+  storage = fw.Settings.storage settings
+  (catalog, _) = fw.readJson storage "state.json" fw.empty
+  course = fw.getById courseId (fw.list (fw.field "courses" catalog))
+  (saved, tag) = fw.readJson storage "registrations.json" fw.registrationEmpty
+  rows = fw.list (fw.field "registrations" saved)
+  existing = List.find (r -> fw.text (fw.field "courseId" r) === courseId && fw.text (fw.field "userId" r) === fw.User.id user) rows
+  if course === Json.Null || fw.field "archived" course === Json.boolean true then fw.error 404 "Course unavailable"
+  else match existing with
+    Some row -> fw.json 200 row
+    None ->
+      if not (fw.field "registrationOpen" (fw.field "offering" course) === Json.boolean true) then fw.error 409 "Registration closed"
+      else
+        githubUrl = if fw.Settings.mode settings === "azure" then "https://github.com/" ++ fw.User.name user else ""
+        row = Json.object [("courseId", Json.text courseId), ("userId", Json.text (fw.User.id user)), ("name", Json.text (fw.User.name user)), ("githubUrl", Json.text githubUrl), ("registeredAt", Json.text (lib.base.time.Instant.toRFC1123 (lib.base.time.Instant.now ())))]
+        next = Json.object [("revision", Json.nat (fw.number (fw.field "revision" saved) Nat.+ 1)), ("registrations", Json.array (rows List.:+ row))]
+        if fw.writeJson storage "registrations.json" tag next then fw.json 201 row
+        else if attempts > 0 then fw.register settings user courseId (attempts Nat.- 1)
+        else fw.error 409 "Registration changed. Retry."
+
 fw.progressKey : fw.User -> Text
 fw.progressKey user = "users/" ++ fw.User.id user ++ ".json"
 
@@ -298,6 +372,10 @@ fw.memberRoute settings user method path headers body =
   (catalog, catalogTag) = fw.readJson storage "state.json" fw.empty
   (progress, progressTag) = fw.readJson storage (fw.progressKey user) fw.progressEmpty
   match (method, path) with
+    (GET, ["api", "registrations"]) -> fw.registrationList storage user false catalog
+    (GET, ["api", "admin", "registrations"]) -> fw.registrationList storage user true catalog
+    (POST, ["api", "courses", courseId, "registrations"]) ->
+      if not (fw.id courseId) then fw.error 400 "Invalid course" else fw.register settings user courseId 3
     (GET, ["api", "state"]) -> fw.json 200 (fw.view user catalog progress)
     (PUT, ["api", "state"]) ->
       if not (fw.User.admin user) then fw.error 403 "Admin access required"
@@ -364,6 +442,7 @@ fw.route settings lock request =
   if path === ["health"] && method === GET then fw.json 200 (Json.object [("status", Json.text "ok")])
   else if (fw.Settings.mode settings != "locked" && not (host === expectedHost || localHost)) || not trusted then fw.error 403 "Invalid origin"
   else match (method, path) with
+    (GET, ["api", "courses"]) -> fw.publicCourses (fw.Settings.storage settings)
     (GET, ["api", "session"]) -> fw.session settings identity
     (GET, []) -> fw.response 200 (fw.mime "html") (FilePath.readFile (FilePath "ui/index.html"))
     (GET, ["style.css"]) -> fw.response 200 (fw.mime "css") (FilePath.readFile (FilePath "ui/style.css"))
@@ -400,6 +479,7 @@ main = do
     fw.Storage.Disk dir
   else fw.Storage.Blob blob
   settings = fw.Settings.Settings storage mode origin admins
+  fw.publishLaunch storage 3
   lock = MVar.new ()
   routes = Routes.Routes [Handler.Handler (fw.route settings lock)] (_ -> fw.error 404 "Not found") (_ _ -> fw.error 500 "Storage unavailable")
   config = Config.default |> Config.hostName.set (Some (HostName.HostName bind)) |> Config.port.set (Port.Port port) |> Config.idleTimeoutSeconds.set (Some 300)

@@ -58,7 +58,7 @@ try {
     [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($secretPointer)
 }
 # Public UI assets remain available. Session discovery and course APIs require login.
-$publicPaths = @('/','/style.css','/app.js','/favicon.svg','/health')
+$publicPaths = @('/','/style.css','/app.js','/favicon.svg','/health','/api/courses')
 $authDocument = @{properties=@{
     platform=@{enabled=$true}
     globalValidation=@{unauthenticatedClientAction='Return401';excludedPaths=$publicPaths}

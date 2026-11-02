@@ -2,17 +2,21 @@
 
 A dark, nonlinear course atlas for systems architecture, engineering, and design. Sponsored by [Obsidian Legion](https://github.com/Obsidian-Legion).
 
-The server is written in **Unison**. The browser uses native HTML, CSS, and JavaScript. The library starts empty.
+The server is written in **Unison**. The browser uses native HTML, CSS, and JavaScript. The first real offering is **Systems Architecture for Vibe Coders**, free and online every Tuesday from November 17 through December 15, 2026, at 5:00 PM Eastern.
 
 ## Accounts
 
 Members sign up or sign in with GitHub. Their GitHub identity is attached automatically to their FIELDWORK profile. There is no separate password to manage.
 
-- **Admins:** upload, edit, connect, and archive courses.
-- **Members:** read courses and keep private notes, progress, and map positions.
+- **Admins:** upload, edit, connect, and archive courses; open or close registration; view students under **Your account → Students**, with course and username filters.
+- **Members:** register for courses, read materials, and keep private notes, progress, and map positions.
 - **Everyone:** PDF, MP4, WebM, TXT, and Markdown lesson viewing; search and a spatial atlas.
 
 Admin access is assigned through an allowlist of immutable GitHub user IDs, never through the sign-up form. Uploads are limited to 100 MB per file. Course files require authentication.
+
+Visitors can see the course schedule before signing in. **Register free** takes them through GitHub and back to the course overview, where they confirm registration. Account creation alone does not enroll a student. The admin roster lists the verified GitHub username, course, and registration time; no separate admin account is needed. Registrations persist in private storage and duplicate submissions are idempotent. Closing or archiving a course retains its roster.
+
+`content/launch-course.json` contains the supplied launch offering, not demo data. Startup adds it once by stable ID, preserving existing courses and subsequent admin edits. No lesson files or meeting URL have been supplied yet. Add course materials through the existing admin controls.
 
 ## Run locally
 
@@ -56,9 +60,10 @@ $env:FIELDWORK_ORIGIN='http://127.0.0.1:8788'
 
 # A second terminal:
 node scripts/verify-auth.mjs
+node scripts/verify-registration.mjs
 ```
 
-These tests simulate Azure's verified headers to check anonymous denial, admin-only mutation, member isolation, course-file access, archived content, byte ranges, optimistic concurrency, and origin checks. They do not verify GitHub OAuth itself. GitHub Actions also builds the Linux container from source and verifies that an unconfigured deployment fails closed.
+These tests simulate Azure's verified headers to check anonymous denial, admin-only mutation and rosters, member isolation, course-file access, archived content, byte ranges, optimistic concurrency, registration identity, duplicate/concurrent enrollments, the published schedule, and origin checks. They do not verify GitHub OAuth itself. GitHub Actions also builds the Linux container from source and verifies that an unconfigured deployment fails closed.
 
 After test-server use, clear those three environment variables before restarting normal local mode. Test stores and generated files are ignored by Git.
 

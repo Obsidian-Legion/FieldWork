@@ -30,6 +30,7 @@ jobs:
             sleep 1
           done
           node scripts/verify-auth.mjs
+          node scripts/verify-registration.mjs
       - name: Verify locked deployment
         run: |
           docker run -d --name fieldwork-locked -p 127.0.0.1:8789:8787 fieldwork:verify

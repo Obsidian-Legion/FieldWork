@@ -1,0 +1,46 @@
+import assert from 'node:assert/strict';
+import {randomUUID} from 'node:crypto';
+
+// Run only against the disposable local verification container.
+const base='http://127.0.0.1:8788';
+const request=(path,id,options={})=>fetch(base+path,{...options,headers:{...(id?{'X-MS-CLIENT-PRINCIPAL-ID':id,'X-MS-CLIENT-PRINCIPAL-IDP':'github','X-MS-CLIENT-PRINCIPAL-NAME':`registration-${id}`} : {}),...options.headers}});
+const json=async(path,id)=>{const r=await request(path,id);assert.equal(r.status,200);return r.json();};
+const save=c=>request('/api/state','101',{method:'PUT',headers:{'Content-Type':'application/json','If-Match':String(c.revision)},body:JSON.stringify(c)});
+const publicCourses=await json('/api/courses');
+const launch=publicCourses.courses.find(c=>c.id==='a3896f19-2dac-4e39-82e0-3e452fdf7637');
+assert.ok(launch);assert.equal(launch.offering.registrationOpen,true);
+assert.deepEqual(launch.offering.sessions.map(s=>new Date(s).toISOString()),['2026-11-17','2026-11-24','2026-12-01','2026-12-08','2026-12-15'].map(s=>s+'T22:00:00.000Z'));
+for(const c of publicCourses.courses){assert.equal(c.notes,undefined);assert.equal(c.lessons,undefined);assert.equal(c.registrations,undefined);}
+const courseId=randomUUID();
+let catalog=await json('/api/state','101');
+catalog.courses.push({...structuredClone(launch),id:courseId,title:'Registration verification',notes:'',lessons:[],x:1000,y:500,archived:false,createdAt:new Date().toISOString()});
+assert.equal((await save(catalog)).status,200);
+const path=`/api/courses/${courseId}/registrations`;
+assert.equal((await request(path,null,{method:'POST'})).status,401);
+assert.equal((await request('/api/registrations')).status,401);
+assert.equal((await request('/api/admin/registrations')).status,401);
+assert.equal((await request('/api/admin/registrations','402')).status,403);
+assert.equal((await request(path,'402',{method:'POST',headers:{Origin:'https://example.com'}})).status,403);
+const before=Date.now();
+let response=await request(path,'402',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({userId:'101',name:'forged-admin',registeredAt:'2000-01-01'})});
+assert.equal(response.status,201);const registration=await response.json();
+assert.equal(registration.userId,'402');assert.equal(registration.name,'registration-402');assert.equal(registration.githubUrl,'https://github.com/registration-402');assert.ok(Date.parse(registration.registeredAt)>=before-1000);
+assert.equal((await request(path,'402',{method:'POST'})).status,200);
+const statuses=await Promise.all(Array.from({length:6},(_,i)=>request(path,String(500+i%3),{method:'POST'}).then(r=>r.status)));
+assert.equal(statuses.filter(s=>s===201).length,3);assert.equal(statuses.filter(s=>s===200).length,3);
+const rows=(await json('/api/admin/registrations','101')).registrations.filter(r=>r.courseId===courseId);
+assert.equal(rows.length,4);assert.equal(new Set(rows.map(r=>r.userId)).size,4);assert.ok(rows.every(r=>r.courseTitle==='Registration verification'));
+assert.equal((await json('/api/registrations','402')).registrations.filter(r=>r.courseId===courseId).length,1);
+assert.equal((await json('/api/registrations','403')).registrations.some(r=>r.courseId===courseId),false);
+assert.equal((await request(`/api/courses/${randomUUID()}/registrations`,'403',{method:'POST'})).status,404);
+catalog=await json('/api/state','101');catalog.courses.find(c=>c.id===courseId).offering.registrationOpen=false;
+assert.equal((await save(catalog)).status,200);
+assert.equal((await request(path,'403',{method:'POST'})).status,409);
+assert.equal((await request(path,'402',{method:'POST'})).status,200);
+catalog=await json('/api/state','101');catalog.courses.find(c=>c.id===courseId).archived=true;
+assert.equal((await save(catalog)).status,200);
+assert.equal((await request(path,'403',{method:'POST'})).status,404);
+assert.equal((await json('/api/courses')).courses.some(c=>c.id===courseId),false);
+assert.equal((await json('/api/admin/registrations','101')).registrations.filter(r=>r.courseId===courseId).length,4);
+assert.equal((await request('/registrations.json','101')).status,404);
+console.log('PASS: real public schedule; sanitized listing; protected roster; verified identity; member isolation; idempotent/concurrent registration; closed and archived enrollment; retained roster.');
